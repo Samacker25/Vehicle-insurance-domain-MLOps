@@ -5,12 +5,16 @@ on:
     branches: [main]
 
 jobs:
+
   Continuous-Integration:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Checkout latest code
+        uses: actions/checkout@v3
+        with:
+          clean: true
+          fetch-depth: 0
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
@@ -24,23 +28,25 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v1
 
       - name: Build, tag, and push image to Amazon ECR
-        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
           IMAGE_TAG: latest
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .  
+          docker build --no-cache -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-
+      
 
   Continuous-Deployment:
     needs: Continuous-Integration
     runs-on: self-hosted
+
     steps:
-      - name: Checkout
+      - name: Checkout latest code (force clean)
         uses: actions/checkout@v3
+        with:
+          clean: true
+          fetch-depth: 0
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
@@ -53,17 +59,18 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      #  Stop and remove any container using port 5000
-      - name: Clean up old containers on port 5000
+      - name: Pull latest image from ECR
+        run: |
+          docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+
+      - name: Stop and remove container on port 5000
         run: |
           ID=$(docker ps -q --filter "publish=5000")
           if [ -n "$ID" ]; then
-            echo "Stopping container using port 5000: $ID"
             docker stop $ID
             docker rm $ID
           fi
 
-       # Also remove old container with same name (optional but recommended)
       - name: Remove old container by name
         run: |
           if [ "$(docker ps -aq -f name=vehicle_app)" ]; then
@@ -71,6 +78,17 @@ jobs:
             docker rm vehicle_app || true
           fi
 
-      - name: Run Docker Image to serve users
+      - name: Remove old image
         run: |
-         docker run -d -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" -e MONGODB_URL="${{ secrets.MONGODB_URL }}" -p 5000:5000 "${{ steps.login-ecr.outputs.registry }}"/"${{ secrets.ECR_REPO }}":latest
+          docker rmi ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest || true
+
+      - name: Run latest Docker image
+        run: |
+          docker run -d \
+            -p 5000:5000 \
+            --name vehicle_app \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" \
+            -e MONGODB_URL="${{ secrets.MONGODB_URL }}" \
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
